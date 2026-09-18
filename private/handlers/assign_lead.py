@@ -49,9 +49,11 @@ def change_lead_category(
     return result.data or {}
 
 
-def preview_category_queue(category_id: str) -> dict[str, Any]:
-    """Use the same read-only SQL planner that actual assignments use."""
+def preview_category_queue(category_id: str, count: int = 3) -> dict[str, Any]:
+    """Forecast upcoming assignments without consuming turns or adjustments."""
+    if not 1 <= count <= 10:
+        raise ValueError("count must be between 1 and 10")
     result = supabase.rpc(
-        "plan_category_queue", {"p_category_id": category_id}
+        "preview_category_queue_next", {"p_category_id": category_id, "p_count": count}
     ).execute()
-    return result.data or {"next_member": None, "compensations": [], "skips": []}
+    return result.data or {"next_members": [], "compensations": [], "skips": []}

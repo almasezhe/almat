@@ -1,6 +1,8 @@
 from __future__ import annotations
 from html import escape
 import os
+import asyncio
+import logging
 from secrets import token_hex
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -717,6 +719,29 @@ async def change_lead_confirm_handler(callback: CallbackQuery, state: FSMContext
     await callback.answer()
 
 
+def format_category_change(lead_id, lead_url: str, member: dict, result: dict) -> str:
+    manager = escape(str(result.get("assignee_name") or member["display_name"]))
+    old_name = escape(str(result.get("old_category_name") or "Неизвестно"))
+    new_name = escape(str(result.get("new_category_name") or "Неизвестно"))
+    blocks = [
+        f"<b>Смена Категории - лид #{escape(str(lead_id))}</b>\n"
+        f"Менеджер: {manager}",
+        f"Ссылка: {escape(lead_url)}",
+        f"<b>Категория успешно изменена:</b>\n{old_name} → {new_name}",
+    ]
+    if result.get("compensation_created"):
+        blocks.append(
+            f"<b>Изменения в компенсации:</b>\n"
+            f"{old_name}: компенсация для {manager}"
+        )
+    if result.get("skip_created"):
+        blocks.append(
+            f"<b>Изменения в пропусках:</b>\n"
+            f"{new_name}: {manager} пропускает следующего лида"
+        )
+    return "\n\n".join(blocks)
+
+
 @router.callback_query(
     F.data.startswith("change_new:")
 )
@@ -800,46 +825,15 @@ async def change_new_category_handler(
     status = result.get("status")
 
     if status == "changed":
-        text = (
-            f"Смена Категории - лид #{lead_id}\n"
-            f"Менеджер: {member['display_name']}\n\n"
-
-            f"Ссылка: {lead_url}\n"
-            f"Категория успешно изменена:\n"
-            f"{result.get('old_category_name')} → "
-            f"{result.get('new_category_name')}"
-            
-        )
-        extra = []
-
-        if result.get(
-            "compensation_created"
-        ):
-            extra.append(
-                f"Изменения в компенсации: \n"
-                f"{result.get('old_category_name')} - "
-                f"компенсация для "
-                f"{result.get('assignee_name')}"
-            )
-
-        if result.get("skip_created"):
-            extra.append(
-                f"Изменения в пропусках: \n"
-                f"{result.get('new_category_name')}: "
-                f"{result.get('assignee_name')} "
-                f"пропускает следующего лида"
-            )
-
-        if extra:
-            text += "\n\n" + "\n".join(extra)
+        text = format_category_change(lead_id, lead_url, member, result)
 
         await callback.answer()
         # Same success message goes to every registered team group, even if
         # the private message can no longer be edited.
         try:
-            await callback.message.edit_text(text, parse_mode=None)
+            await callback.message.edit_text(text, parse_mode="HTML")
         finally:
-            await notify_team(callback.bot, text)
+            await notify_team(callback.bot, text, parse_mode="HTML")
         return
 
     errors = {
@@ -875,15 +869,12 @@ async def change_new_category_handler(
 
     await callback.answer()
 # ============================================================
-# QUEUES (ADMIN)
+# QUEUES (ALL ACTIVE MEMBERS)
 # ============================================================
 @router.message(Command("queues"))
 async def queues_handler(message: Message):
     member = await deny_if_not_member(message)
     if not member:
-        return
-    if not member["is_admin"]:
-        await message.answer("/queues доступно только для администраторов")
         return
 
     categories = (
@@ -899,23 +890,31 @@ async def queues_handler(message: Message):
     for category in categories.data or []:
         if category["code"] == "trash":
             continue
-        preview = preview_category_queue(category["id"])
-        next_member = preview["next_member"]
-        next_text = (
-            f"{next_member['display_name']}"
-            if next_member
-            else "Нету онлайн мемберов"
-        )
-        compensations = ", ".join(preview["compensations"]) or "none"
-        skips = ", ".join(preview["skips"]) or "none"
+        try:
+            preview = await asyncio.to_thread(preview_category_queue, category["id"], 3)
+        except Exception:
+            logging.exception("Queue preview failed for category %s", category["id"])
+            await message.answer(
+                "Не удалось получить очередь. Администратору: проверьте, что "
+                "queues_preview.sql выполнен в Supabase.",
+                parse_mode=None,
+            )
+            return
+        next_text = " → ".join(
+            entry["display_name"] for entry in preview.get("next_members", [])
+        ) or "Нет доступных менеджеров онлайн"
+        compensations = ", ".join(preview.get("compensations", [])) or "нет"
+        skips = ", ".join(preview.get("skips", [])) or "нет"
         blocks.append(
             f"{category['name']}\n"
-            f"Следующий: {next_text}\n"
+            f"Следующие: {next_text}\n"
             f"Компенсации: {compensations}\n"
             f"Пропуски: {skips}"
         )
 
-    await message.answer("\n\n".join(blocks) if blocks else "No distributable categories.", parse_mode=None)
+    await answer_plain_chunks(
+        message, "\n\n".join(blocks) if blocks else "Нет категорий для распределения."
+    )
 
 
 # ============================================================
@@ -930,36 +929,84 @@ def format_lead_timestamp(value: str | None) -> str:
         return "unknown date"
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
-    return timestamp.astimezone(timezone(timedelta(hours=5))).strftime("%H:%M:%S")
+    return timestamp.astimezone(LOCAL_TZ).strftime("%H:%M:%S")
 
 
-@router.message(Command("my_leads"))
+def today_assignment_bounds(now: datetime | None = None) -> tuple[str, str, str]:
+    local_now = now.astimezone(LOCAL_TZ) if now is not None else datetime.now(LOCAL_TZ)
+    start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    return (
+        start.astimezone(timezone.utc).isoformat(),
+        end.astimezone(timezone.utc).isoformat(),
+        start.strftime("%d.%m.%Y"),
+    )
+
+
+def get_today_leads(member_id: str, start: str, end: str) -> list[dict]:
+    leads = []
+    # Stable pagination avoids the API's default row cap.
+    while True:
+        page = (
+            supabase.table("leads")
+            .select(
+                "id, lead_url, original_category_id, current_category_id, "
+                "assigned_at, created_at"
+            )
+            .eq("assignee_id", member_id)
+            .gte("assigned_at", start)
+            .lt("assigned_at", end)
+            .order("assigned_at", desc=True)
+            .order("id", desc=True)
+            .range(len(leads), len(leads) + 499)
+            .execute()
+        ).data or []
+        if not page:
+            return leads
+        leads.extend(page)
+
+
+def split_plain_text(text: str, limit: int = 4000) -> list[str]:
+    # Budget UTF-16 units too, so names with emoji cannot exceed Telegram limits.
+    chunks = []
+    while text:
+        units = 0
+        cut = len(text)
+        for index, char in enumerate(text):
+            units += 2 if ord(char) > 0xFFFF else 1
+            if units > limit:
+                cut = index
+                break
+        if cut < len(text):
+            newline = text.rfind("\n", 0, cut)
+            if newline > 0:
+                cut = newline + 1
+        chunks.append(text[:cut])
+        text = text[cut:]
+    return chunks
+
+
+async def answer_plain_chunks(message: Message, text: str) -> None:
+    for chunk in split_plain_text(text):
+        await message.answer(chunk, parse_mode=None)
+
+
+@router.message(Command("myleads", "my_leads"))
 async def my_leads_handler(message: Message):
     member = await deny_if_not_member(message)
     if not member:
         return
 
-    leads_result = (
-        supabase.table("leads")
-        .select(
-            "id, lead_url, original_category_id, current_category_id, "
-            "assigned_at, created_at"
-        )
-        .eq("assignee_id", member["id"])
-        .order("assigned_at", desc=True)
-        .limit(1000)
-        .execute()
-    )
-    leads = leads_result.data or []
-
+    start, end, date_label = today_assignment_bounds()
+    leads = await asyncio.to_thread(get_today_leads, member["id"], start, end)
     if not leads:
-        await message.answer("У вас нет назначенных лидов.")
+        await message.answer(f"Сегодня ({date_label}) у вас нет назначенных лидов.")
         return
 
     category_ids = {
-        lead["current_category_id"] for lead in leads
-    } | {
-        lead["original_category_id"] for lead in leads
+        lead[key] for lead in leads
+        for key in ("current_category_id", "original_category_id")
+        if lead.get(key) is not None
     }
     categories_result = (
         supabase.table("categories")
@@ -970,36 +1017,30 @@ async def my_leads_handler(message: Message):
     category_names = {
         row["id"]: row["name"] for row in (categories_result.data or [])
     }
-
     counts = Counter(
         category_names.get(lead["current_category_id"], "Неизвестно")
         for lead in leads
     )
-
     summary_lines = [f"{name} — {count}" for name, count in counts.most_common()]
-    recent_lines = []
-    for lead in leads[:20]:
+    lead_lines = []
+    for lead in leads:
         current_name = category_names.get(lead["current_category_id"], "Неизвестно")
         original_name = category_names.get(lead["original_category_id"], "Неизвестно")
         category_text = current_name
         if original_name != current_name:
-            category_text += f" (original: {original_name})"
-        assigned = format_lead_timestamp(lead.get("assigned_at") or lead.get("created_at"))
-        recent_lines.append(
-            f"• Lead #{lead['id']} · {category_text}\n  {lead['lead_url']}\n  {assigned}"
+            category_text += f" (изначально: {original_name})"
+        assigned = format_lead_timestamp(lead.get("assigned_at"))
+        lead_lines.append(
+            f"• Лид #{lead['id']} · {category_text}\n  {lead['lead_url']}\n  {assigned}"
         )
-
     text = (
-        f"{member['display_name']}\n\n"
+        f"{member['display_name']}\nСегодня: {date_label}\n\n"
         + "\n".join(summary_lines)
-        + f"\n\nTotal — {len(leads)}"
-        + "\n\nНедавние лиды:\n"
-        + "\n\n".join(recent_lines)
+        + f"\n\nВсего за сегодня — {len(leads)}"
+        + "\n\nЛиды за сегодня:\n"
+        + "\n\n".join(lead_lines)
     )
-    if len(leads) > 20:
-        text += f"\n\nПоказываем последние 20 из {len(leads)} лидов."
-
-    await message.answer(text[:4096], parse_mode=None)
+    await answer_plain_chunks(message, text)
 
 
 # ============================================================
