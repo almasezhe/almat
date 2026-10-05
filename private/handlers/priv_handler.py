@@ -120,6 +120,12 @@ async def notify_team(bot, text: str, *, parse_mode=None) -> None:
 # ============================================================
 # START / ACCESS CONTROL
 # ============================================================
+@router.message(Command("cancel"))
+async def cancel_handler(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Текущее действие отменено.")
+
+
 @router.message(CommandStart())
 async def start_handler(message: Message):
     user = message.from_user

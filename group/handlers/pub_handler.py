@@ -14,7 +14,7 @@ router.message.filter(
 def get_member(telegram_id: int) -> dict | None:
     result = (
         supabase.table("team_members")
-        .select("id, is_admin, is_active")
+        .select("id, is_active")
         .eq("telegram_id", telegram_id)
         .limit(1)
         .execute()
@@ -25,10 +25,10 @@ def get_member(telegram_id: int) -> dict | None:
 @router.message(CommandStart())
 async def start_handler(message: Message):
     # This is the SAME bot as the private bot. This router is only for groups.
-    # Only an active admin can register a group for team-wide notifications.
+    # Any active team member can register a group for team-wide notifications.
     member = get_member(message.from_user.id)
-    if not member or not member["is_active"] or not member["is_admin"]:
-        await message.answer("Only an active administrator can register this group.")
+    if not member or not member["is_active"]:
+        await message.answer("Сначала зарегистрируйтесь через /start в личке бота.")
         return
 
     (
