@@ -891,7 +891,7 @@ async def queues_handler(message: Message):
         if category["code"] == "trash":
             continue
         try:
-            preview = await asyncio.to_thread(preview_category_queue, category["id"], 3)
+            preview = await asyncio.to_thread(preview_category_queue, category["id"], 5)
         except Exception:
             logging.exception("Queue preview failed for category %s", category["id"])
             await message.answer(
